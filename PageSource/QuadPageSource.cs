@@ -1,13 +1,21 @@
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using TotkCave.Models;
 
 namespace TotkCave.PageSource;
 
+/// <summary>
+/// Loads .quad pages, decompressing romfs ones if needed.
+///
+/// Console-dumped pages are already decompressed (their size equals the crbin's
+/// decompressed_size). A romfs .quad is a 4-byte crbin id followed by a plain
+/// zstd frame - no MeshCodec involved.
+/// </summary>
 public sealed class QuadPageSource : IPageSource
 {
     private readonly QuadResource _resource;
     private readonly string? _pagesDir;
-    private readonly Dictionary<int, byte[]> _cache = [];
+    private readonly ConcurrentDictionary<int, byte[]> _cache = new();
 
     public string SourceKind { get; private set; } = "quad";
 
@@ -25,12 +33,12 @@ public sealed class QuadPageSource : IPageSource
         (uint decompressedSize, uint pageId) = _resource.GetPageFile(fid);
 
         string pageDir = _resource.Path + $".{_resource.Id:x8}";
-        string cand1 = Path.Combine(pageDir, $"{fid:D6}.quad");
-        string cand2 = Path.Combine(pageDir, $"{fid:D6}");
+        string cand1 = Path.Combine(pageDir, $"{pageId:D6}.quad");
+        string cand2 = Path.Combine(pageDir, $"{pageId:D6}");
         if (!string.IsNullOrEmpty(_pagesDir))
         {
-            string cand3 = Path.Combine(_pagesDir, $"{fid:D6}.quad");
-            string cand4 = Path.Combine(_pagesDir, $"{fid:D6}");
+            string cand3 = Path.Combine(_pagesDir, $"{pageId:D6}.quad");
+            string cand4 = Path.Combine(_pagesDir, $"{pageId:D6}");
             if (File.Exists(cand3)) cand1 = cand3;
             else if (File.Exists(cand4)) cand1 = cand4;
         }
@@ -39,46 +47,43 @@ public sealed class QuadPageSource : IPageSource
             cand1 = cand2;
 
         if (!File.Exists(cand1))
-            throw new FileNotFoundException($"Quad page file missing for page {fid}: {cand1}");
+            throw new FileNotFoundException($"Quad page file missing for page {pageId} (index {fid}): {cand1}");
 
         byte[] raw = File.ReadAllBytes(cand1);
+        byte[] page;
+
         if (raw.Length == decompressedSize)
         {
-            _cache[fid] = raw;
-            return raw;
+            page = raw;                                     // console dump: already decompressed
+            SourceKind = "quad-console";
         }
-
-        if (raw.Length > 4 && MemoryMarshal.Read<uint>(raw) == _resource.Id)
+        else if (raw.Length > 4 && MemoryMarshal.Read<uint>(raw) == _resource.Id)
         {
-            byte[] decompressed = DecompressZstdFrame(raw.AsSpan(4), (int)decompressedSize);
-            _cache[fid] = decompressed;
-            return decompressed;
+            page = DecompressZstdFrame(raw.AsSpan(4), (int)decompressedSize);
+            SourceKind = "quad-romfs-zstd";
+        }
+        else
+        {
+            page = raw;
         }
 
-        _cache[fid] = raw;
-        return raw;
+        // Another thread may have produced the same page concurrently; keep whichever
+        // landed first so callers always see one shared buffer per page.
+        return _cache.GetOrAdd(fid, page);
     }
 
     private static byte[] DecompressZstdFrame(ReadOnlySpan<byte> compressedFrame, int expectedSize)
     {
-        try
+        byte[] output = new byte[expectedSize];
+        using ZstdSharp.Decompressor decompressor = new();
+
+        int written = decompressor.Unwrap(compressedFrame, output);
+        if (written != expectedSize)
         {
-            var zstdType = Type.GetType("ZStandard.ZstandardStream, ZStandard")
-                ?? Type.GetType("Zstandard.Net.ZstandardStream, Zstandard.Net");
-
-            if (zstdType != null)
-            {
-                using MemoryStream ms = new(compressedFrame.ToArray());
-                using Stream zstream = (Stream)Activator.CreateInstance(zstdType, ms)!;
-                byte[] outBuf = new byte[expectedSize];
-                int read = zstream.Read(outBuf, 0, expectedSize);
-                return outBuf;
-            }
+            throw new InvalidDataException(
+                $"zstd page decompressed to {written} bytes, expected {expectedSize}.");
         }
-        catch { }
 
-        throw new NotSupportedException(
-            "Compressed .quad page encountered. Please install the ZStandard NuGet package " +
-            "or use pre-decompressed console dump quad pages.");
+        return output;
     }
 }

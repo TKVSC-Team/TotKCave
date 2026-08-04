@@ -9,6 +9,7 @@
 - **Binary Parsers**: Memory-mapped binary parsing of `C.crbin` index files (`CrBin`, `QuadResource`).
 - **Zero-Allocation Vertex Decoding**: High-speed bitwise extraction of 28-byte vertex strides, cell-relative quantized positions, octahedral normals, baked AO colors, and material splat weights (`VertexDecoder`).
 - **Flexible Page Management**: Multi-tier page provider supporting console-dumped decompressed pages, stamped disk caches, and automatic MeshCodec CLI process execution (`CavePageSource`, `QuadPageSource`).
+- **Romfs `.quad` Support**: Depths pages straight from romfs (a 4-byte crbin id followed by a plain zstd frame) are decompressed in-process via `ZstdSharp.Port`; console dumps are already decompressed and are used as-is.
 - **World-Space Mesh Builders**: Reconstructs complete 3D surface meshes at any specified LOD level with vertex welding and edge-length threshold cleaning filters (`MeshBuilder`, `QuadMeshBuilder`).
 - **Wavefront OBJ/MTL Exporter**: Exports `.obj` and `.mtl` files with computed triplanar UV projection coordinates (`ObjExporter`).
 
@@ -75,7 +76,7 @@ TotkCave/
 ├── PageSource/
 │   ├── IPageSource.cs            Interface for page retrieval
 │   ├── PageSource.cs             Console dump, cache, & MeshCodec CLI provider
-│   └── QuadPageSource.cs         Depths .quad page reader & Zstd fallback
+│   └── QuadPageSource.cs         Depths .quad page reader & Zstd decompression
 ├── Building/
 │   ├── MeshBuilder.cs            Surface cave 3D mesh generator
 │   └── QuadMeshBuilder.cs        Depths quad terrain 3D mesh generator

@@ -1,5 +1,8 @@
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Text;
 using TotkCave.Models;
 using TotkCave.PageSource;
 
@@ -7,118 +10,282 @@ namespace TotkCave.Building;
 
 public static class QuadMeshBuilder
 {
-    private static readonly Dictionary<(int Ns, int Top, int Right, int Bottom, int Left, int Single), int[]> IndexCache = [];
-    private static readonly Dictionary<int, (int A, int B, int C)[]> FaceCache = [];
+    // Read on every quad from every worker thread, so these are lock-free reads.
+    private static readonly ConcurrentDictionary<(int Ns, int Top, int Right, int Bottom, int Left, int Single), int[]> IndexCache = new();
+    private static readonly ConcurrentDictionary<int, (int A, int B, int C)[]> FaceCache = new();
 
-    public static CaveMesh BuildMesh(QuadResource res, IPageSource pages, int? lod = null, bool weld = true)
+    public static (int Vertices, int Faces, int Nodes) ExportObjStreaming(
+        QuadResource res,
+        IPageSource pages,
+        string outputPath,
+        int? lod = null,
+        bool weld = true,
+        int maxDegreeOfParallelism = -1,
+        Action<int, int, int>? progressCallback = null)
+    {
+        int targetLod = lod ?? res.MaxLod;
+
+        List<int> matchingNodeIndices = [];
+        for (int i = 0; i < res.NodeCount; i++)
+        {
+            if (res.GetNodeLod(i) == targetLod)
+            {
+                matchingNodeIndices.Add(i);
+            }
+        }
+
+        int totalNodes = matchingNodeIndices.Count;
+        if (totalNodes == 0) return (0, 0, 0);
+
+        int threads = maxDegreeOfParallelism > 0 ? maxDegreeOfParallelism : Environment.ProcessorCount;
+        int batchSize = 32;
+        var batches = matchingNodeIndices.Chunk(batchSize).ToList();
+
+        string? dir = Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrEmpty(dir))
+        {
+            Directory.CreateDirectory(dir);
+        }
+
+        using StreamWriter writer = new(outputPath, false, Encoding.UTF8, bufferSize: 1 << 20);
+        writer.WriteLine("# TotK Depths (MinusField) quad mesh - TotkCave (.NET 10)");
+        writer.WriteLine(string.Create(CultureInfo.InvariantCulture, $"# lod {targetLod}, world-space metres"));
+
+        int totalVerts = 0;
+        int totalFaces = 0;
+        int processedNodes = 0;
+
+        progressCallback?.Invoke(0, 0, totalNodes);
+
+        var parallelQuery = batches
+            .AsParallel()
+            .AsOrdered()                                    // must directly follow AsParallel()
+            .WithDegreeOfParallelism(threads)
+            .WithMergeOptions(ParallelMergeOptions.NotBuffered)
+            .Select(batch => DecodeBatch(res, pages, batch, targetLod, weld));
+
+        foreach (var (text, batchVerts, batchFaces, nodeCount) in parallelQuery)
+        {
+            if (batchVerts > 0)
+            {
+                writer.Write(text);
+                totalVerts += batchVerts;
+                totalFaces += batchFaces;
+            }
+            processedNodes += nodeCount;
+            progressCallback?.Invoke(processedNodes, totalVerts, totalNodes);
+        }
+
+        return (totalVerts, totalFaces, totalNodes);
+    }
+
+    private static (string Text, int Vertices, int Faces, int NodeCount) DecodeBatch(
+        QuadResource res,
+        IPageSource pages,
+        int[] nodeIndices,
+        int targetLod,
+        bool weld)
+    {
+        StringBuilder sb = new(1024 * 1024);
+        CultureInfo ci = CultureInfo.InvariantCulture;
+        int batchVerts = 0;
+        int batchFaces = 0;
+        int nodesProcessed = 0;
+
+        foreach (int i in nodeIndices)
+        {
+            var (verts, faces) = DecodeNodeGeometry(res, pages, i, targetLod, weld);
+            nodesProcessed++;
+
+            int vCount = verts.Count;
+            if (vCount == 0) continue;
+
+            for (int vIdx = 0; vIdx < vCount; vIdx++)
+            {
+                Vector3 v = verts[vIdx];
+                sb.AppendLine(string.Create(ci, $"v {v.X:F4} {v.Y:F4} {v.Z:F4}"));
+            }
+
+            // Relative face indexing (-vCount .. -1)
+            for (int fIdx = 0; fIdx < faces.Count; fIdx++)
+            {
+                var (a, b_, c) = faces[fIdx];
+                sb.AppendLine(string.Create(ci, $"f {a - vCount} {b_ - vCount} {c - vCount}"));
+            }
+
+            batchVerts += vCount;
+            batchFaces += faces.Count;
+        }
+
+        return (sb.ToString(), batchVerts, batchFaces, nodesProcessed);
+    }
+
+    private static (List<Vector3> Verts, List<(int A, int B, int C)> Faces) DecodeNodeGeometry(
+        QuadResource res,
+        IPageSource pages,
+        int i,
+        int targetLod,
+        bool weld)
+    {
+        List<Vector3> localVerts = [];
+        List<(int A, int B, int C)> localFaces = [];
+        Dictionary<Vector3, int> vmap = [];
+
+        var (nx, ny, nz, _) = res.GetNode(i);
+        var (layout, ns, cornerOff) = res.GetNodeLayout(i);
+        int vps = (1 << ns) + 1;
+        int nvq = vps * vps;
+        int blockBytes = nvq * 4;
+        var facesPat = GetFacePattern(ns);
+        float sl = res.GetSidelength(targetLod);
+        int nsh = res.GetNodeShift(targetLod);
+
+        float bx = res.SingleBounds.MinX;
+        float by = res.SingleBounds.MinY;
+        float bz = res.SingleBounds.MinZ;
+
+        int pa0 = layout["pos_adjust_offset0"];
+        int qdo = layout["quad_data_offset"];
+
+        var (s0, s1) = res.GetStreamRange(i);
+        for (uint j = s0; j < s1; j++)
+        {
+            var (pfi, flags, baseVtx, nquads) = res.GetStream((int)j);
+            if (flags != 0) continue;
+
+            byte[] page = pages.GetPage(pfi);
+
+            for (int k = 0; k < nquads; k++)
+            {
+                int qi = baseVtx + k;
+                uint corner = MemoryMarshal.Read<uint>(page.AsSpan(cornerOff + qi * 4));
+                uint posFlags = MemoryMarshal.Read<uint>(page.AsSpan(qdo + qi * 8));
+                uint matFlags = MemoryMarshal.Read<uint>(page.AsSpan(qdo + qi * 8 + 4));
+
+                int top = (corner & 0xFF) == 0xD ? 0 : 1;
+                int right = ((corner >> 8) & 0xFF) == 0xD ? 0 : 1;
+                int bottom = ((corner >> 16) & 0xFF) == 0xD ? 0 : 1;
+                int left = ((corner >> 24) & 0xFF) == 0xD ? 0 : 1;
+                int single = (int)((matFlags >> 31) & 1);
+
+                int[] imap = GetIndexMap(ns, top, right, bottom, left, single);
+
+                ReadOnlySpan<uint> block = MemoryMarshal.Cast<byte, uint>(page.AsSpan(pa0 + qi * blockBytes, blockBytes));
+
+                int sh = (int)((posFlags >> 18) & 0x1F);
+                long ox = ((((nx >> nsh) << 5) + (posFlags & 0x3F)) << 13) - 0x20000;
+                long oy = ((((ny >> nsh) << 5) + ((posFlags >> 6) & 0x3F)) << 13) - 0x20000;
+                long oz = ((((nz >> nsh) << 5) + ((posFlags >> 12) & 0x3F)) << 13) - 0x20000;
+
+                int[] localIndices = new int[imap.Length];
+
+                for (int slotIdx = 0; slotIdx < imap.Length; slotIdx++)
+                {
+                    int slot = imap[slotIdx];
+                    uint adj = block[slot];
+
+                    int dx = (int)(adj & 0x7FF);
+                    if ((dx & 0x400) != 0) dx -= 0x800;
+
+                    int dy = (int)((adj >> 11) & 0x3FF);
+                    if ((dy & 0x200) != 0) dy -= 0x400;
+
+                    int dz = (int)((adj >> 21) & 0x7FF);
+                    if ((dz & 0x400) != 0) dz -= 0x800;
+
+                    Vector3 v = new(
+                        (ox + (dx << sh)) * sl + bx,
+                        (oy + ((dy << 1) << sh)) * sl + by,
+                        (oz + (dz << sh)) * sl + bz
+                    );
+
+                    if (weld)
+                    {
+                        if (!vmap.TryGetValue(v, out int localIdx))
+                        {
+                            localIdx = localVerts.Count;
+                            vmap[v] = localIdx;
+                            localVerts.Add(v);
+                        }
+                        localIndices[slotIdx] = localIdx;
+                    }
+                    else
+                    {
+                        int localIdx = localVerts.Count;
+                        localVerts.Add(v);
+                        localIndices[slotIdx] = localIdx;
+                    }
+                }
+
+                foreach (var (a, b_, c) in facesPat)
+                {
+                    int iA = localIndices[a];
+                    int iB = localIndices[b_];
+                    int iC = localIndices[c];
+
+                    if (iA != iB && iB != iC && iA != iC)
+                    {
+                        localFaces.Add((iA, iB, iC));
+                    }
+                }
+            }
+        }
+
+        return (localVerts, localFaces);
+    }
+
+    public static CaveMesh BuildMesh(
+        QuadResource res,
+        IPageSource pages,
+        int? lod = null,
+        bool weld = true,
+        int maxDegreeOfParallelism = -1,
+        Action<int, int>? progressCallback = null)
     {
         int targetLod = lod ?? res.MaxLod;
         CaveMesh mesh = new();
-        Dictionary<Vector3, int> vmap = [];
 
+        List<int> matchingNodeIndices = [];
         for (int i = 0; i < res.NodeCount; i++)
         {
-            var (nx, ny, nz, nodeLod) = res.GetNode(i);
-            if (nodeLod != targetLod) continue;
-
-            var (layout, ns, cornerOff) = res.GetNodeLayout(i);
-            int vps = (1 << ns) + 1;
-            int nvq = vps * vps;
-            int blockBytes = nvq * 4;
-            var facesPat = GetFacePattern(ns);
-            float sl = res.GetSidelength(targetLod);
-            int nsh = res.GetNodeShift(targetLod);
-
-            float bx = res.SingleBounds.MinX;
-            float by = res.SingleBounds.MinY;
-            float bz = res.SingleBounds.MinZ;
-
-            int pa0 = layout["pos_adjust_offset0"];
-            int qdo = layout["quad_data_offset"];
-
-            var (s0, s1) = res.GetStreamRange(i);
-            for (uint j = s0; j < s1; j++)
+            if (res.GetNodeLod(i) == targetLod)
             {
-                var (pfi, flags, baseVtx, nquads) = res.GetStream((int)j);
-                if (flags != 0) continue;
+                matchingNodeIndices.Add(i);
+            }
+        }
 
-                byte[] page = pages.GetPage(pfi);
+        int totalNodes = matchingNodeIndices.Count;
+        if (totalNodes == 0) return mesh;
 
-                for (int k = 0; k < nquads; k++)
-                {
-                    int qi = baseVtx + k;
-                    uint corner = MemoryMarshal.Read<uint>(page.AsSpan(cornerOff + qi * 4));
-                    uint posFlags = MemoryMarshal.Read<uint>(page.AsSpan(qdo + qi * 8));
-                    uint matFlags = MemoryMarshal.Read<uint>(page.AsSpan(qdo + qi * 8 + 4));
+        progressCallback?.Invoke(0, totalNodes);
 
-                    int top = (corner & 0xFF) == 0xD ? 0 : 1;
-                    int right = ((corner >> 8) & 0xFF) == 0xD ? 0 : 1;
-                    int bottom = ((corner >> 16) & 0xFF) == 0xD ? 0 : 1;
-                    int left = ((corner >> 24) & 0xFF) == 0xD ? 0 : 1;
-                    int single = (int)((matFlags >> 31) & 1);
+        int threads = maxDegreeOfParallelism > 0 ? maxDegreeOfParallelism : Environment.ProcessorCount;
+        ParallelOptions parallelOptions = new() { MaxDegreeOfParallelism = threads };
 
-                    int[] imap = GetIndexMap(ns, top, right, bottom, left, single);
+        var nodeResults = new ConcurrentBag<(List<Vector3> Verts, List<(int A, int B, int C)> Faces)>();
+        int completedCount = 0;
 
-                    ReadOnlySpan<uint> block = MemoryMarshal.Cast<byte, uint>(page.AsSpan(pa0 + qi * blockBytes, blockBytes));
+        Parallel.ForEach(matchingNodeIndices, parallelOptions, i =>
+        {
+            var (localVerts, localFaces) = DecodeNodeGeometry(res, pages, i, targetLod, weld);
+            nodeResults.Add((localVerts, localFaces));
 
-                    int sh = (int)((posFlags >> 18) & 0x1F);
-                    long ox = ((((nx >> nsh) << 5) + (posFlags & 0x3F)) << 13) - 0x20000;
-                    long oy = ((((ny >> nsh) << 5) + ((posFlags >> 6) & 0x3F)) << 13) - 0x20000;
-                    long oz = ((((nz >> nsh) << 5) + ((posFlags >> 12) & 0x3F)) << 13) - 0x20000;
+            if (progressCallback != null)
+            {
+                int current = Interlocked.Increment(ref completedCount);
+                progressCallback(current, totalNodes);
+            }
+        });
 
-                    int[] localIndices = new int[imap.Length];
-
-                    for (int slotIdx = 0; slotIdx < imap.Length; slotIdx++)
-                    {
-                        int slot = imap[slotIdx];
-                        uint adj = block[slot];
-
-                        int dx = (int)(adj & 0x7FF);
-                        if ((dx & 0x400) != 0) dx -= 0x800;
-
-                        int dy = (int)((adj >> 11) & 0x3FF);
-                        if ((dy & 0x200) != 0) dy -= 0x400;
-
-                        int dz = (int)((adj >> 21) & 0x7FF);
-                        if ((dz & 0x400) != 0) dz -= 0x800;
-
-                        Vector3 v = new(
-                            (ox + (dx << sh)) * sl + bx,
-                            (oy + ((dy << 1) << sh)) * sl + by,
-                            (oz + (dz << sh)) * sl + bz
-                        );
-
-                        if (weld)
-                        {
-                            if (!vmap.TryGetValue(v, out int globalIdx))
-                            {
-                                globalIdx = mesh.Vertices.Count;
-                                vmap[v] = globalIdx;
-                                mesh.Vertices.Add(v);
-                            }
-                            localIndices[slotIdx] = globalIdx;
-                        }
-                        else
-                        {
-                            int globalIdx = mesh.Vertices.Count;
-                            mesh.Vertices.Add(v);
-                            localIndices[slotIdx] = globalIdx;
-                        }
-                    }
-
-                    foreach (var (a, b_, c) in facesPat)
-                    {
-                        int iA = localIndices[a];
-                        int iB = localIndices[b_];
-                        int iC = localIndices[c];
-
-                        if (iA != iB && iB != iC && iA != iC)
-                        {
-                            mesh.Faces.Add((iA, iB, iC));
-                            mesh.FaceMaterials.Add(0);
-                        }
-                    }
-                }
+        foreach (var resNode in nodeResults)
+        {
+            int baseV = mesh.Vertices.Count;
+            mesh.Vertices.AddRange(resNode.Verts);
+            for (int f = 0; f < resNode.Faces.Count; f++)
+            {
+                var (a, b_, c) = resNode.Faces[f];
+                mesh.Faces.Add((a + baseV, b_ + baseV, c + baseV));
+                mesh.FaceMaterials.Add(0);
             }
         }
 
@@ -159,8 +326,7 @@ public static class QuadMeshBuilder
             }
         }
 
-        IndexCache[key] = outMap;
-        return outMap;
+        return IndexCache.GetOrAdd(key, outMap);
     }
 
     private static (int A, int B, int C)[] GetFacePattern(int ns)
@@ -180,8 +346,6 @@ public static class QuadMeshBuilder
             }
         }
 
-        var res = faces.ToArray();
-        FaceCache[ns] = res;
-        return res;
+        return FaceCache.GetOrAdd(ns, faces.ToArray());
     }
 }

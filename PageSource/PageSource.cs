@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using TotkCave.Models;
@@ -12,7 +13,7 @@ public sealed class CavePageSource : IPageSource
     private readonly CrBin _crbin;
     private readonly string? _pagesDir;
     private readonly string? _mcTool;
-    private readonly Dictionary<int, byte[]> _cache = [];
+    private readonly ConcurrentDictionary<int, byte[]> _cache = new();
     private readonly Dictionary<int, ushort> _blocks = [];
 
     public string SourceKind { get; private set; } = "unknown";
@@ -105,7 +106,7 @@ public sealed class CavePageSource : IPageSource
 
         throw new FileNotFoundException(
             $"No decompressed page available for chunk {fid:D6}. " +
-            $"MeshCodec CLI tool not found and no console dump was provided.");
+            $"MeshCodec CLI tool not found. Pass --mc <path/to/mc_decompress.exe> or set $MC_TOOL env var.");
     }
 
     private byte[] Store(int fid, byte[] data, string kind)
@@ -174,18 +175,38 @@ public sealed class CavePageSource : IPageSource
         string baseDir = AppDomain.CurrentDomain.BaseDirectory;
         string cwd = Directory.GetCurrentDirectory();
 
-        string[] candidates = [
-            Path.Combine(cwd, "meshcodec-fix-tools", "mc_test_fixed.exe"),
-            Path.Combine(cwd, "bin", "mc_decompress.exe"),
-            Path.Combine(cwd, "MeshCodec", "build", "Release", "mc_test.exe"),
-            Path.Combine(cwd, "MeshCodec", "build", "Release", "mc_decompress.exe"),
-            Path.Combine(baseDir, "meshcodec-fix-tools", "mc_test_fixed.exe"),
-            Path.Combine(baseDir, "bin", "mc_decompress.exe")
+        string[] names = ["mc_decompress.exe", "mc_test_fixed.exe", "mc_decompress", "mc_test_fixed", "mc_test.exe", "mc_test"];
+
+        List<string> searchDirs = [
+            cwd,
+            baseDir,
+            Path.Combine(cwd, "bin"),
+            Path.Combine(cwd, "meshcodec-fix-tools"),
+            Path.Combine(cwd, "MeshCodec", "build", "Release"),
+            Path.Combine(cwd, "..", "bin"),
+            Path.Combine(cwd, "..", "meshcodec-fix-tools"),
+            Path.Combine(cwd, "..", "totk-cave-tools", "bin"),
+            Path.Combine(baseDir, "bin"),
+            Path.Combine(baseDir, "meshcodec-fix-tools"),
+            Path.Combine(baseDir, "..", "bin"),
+            Path.Combine(baseDir, "..", "meshcodec-fix-tools"),
+            Path.Combine(baseDir, "..", "totk-cave-tools", "bin")
         ];
 
-        foreach (string cand in candidates)
+        string? pathEnv = Environment.GetEnvironmentVariable("PATH");
+        if (!string.IsNullOrEmpty(pathEnv))
         {
-            if (File.Exists(cand)) return cand;
+            searchDirs.AddRange(pathEnv.Split(Path.PathSeparator));
+        }
+
+        foreach (string dir in searchDirs)
+        {
+            if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir)) continue;
+            foreach (string name in names)
+            {
+                string fullPath = Path.Combine(dir, name);
+                if (File.Exists(fullPath)) return fullPath;
+            }
         }
 
         return null;

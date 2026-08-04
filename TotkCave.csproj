@@ -10,4 +10,8 @@
     <Description>C# library for parsing, decompressing, building, and exporting Tears of the Kingdom cave and quad mesh streaming files.</Description>
   </PropertyGroup>
 
+  <ItemGroup>
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.8" />
+  </ItemGroup>
+
 </Project>

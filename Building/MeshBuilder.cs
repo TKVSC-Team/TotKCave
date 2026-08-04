@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using TotkCave.Decoding;
@@ -13,7 +14,9 @@ public static class MeshBuilder
         IPageSource pages,
         int? lod = null,
         bool weld = true,
-        float clean = 0.0f)
+        float clean = 0.0f,
+        int maxDegreeOfParallelism = -1,
+        Action<int, int>? progressCallback = null)
     {
         int targetLod = lod ?? crbin.NumSubdivisions;
         if (targetLod > crbin.NumSubdivisions)
@@ -39,11 +42,26 @@ public static class MeshBuilder
             Materials = crbin.Materials
         };
 
-        Dictionary<object, int> vmap = [];
+        var matchingNodes = crbin.Nodes.Where(n => n.Lod == targetLod).ToList();
+        int totalNodes = matchingNodes.Count;
+        if (totalNodes == 0) return mesh;
 
-        foreach (CrBinNode node in crbin.Nodes)
+        int threads = maxDegreeOfParallelism > 0 ? maxDegreeOfParallelism : Environment.ProcessorCount;
+        ParallelOptions parallelOptions = new() { MaxDegreeOfParallelism = threads };
+
+        var nodeResults = new ConcurrentBag<(List<Vector3> Verts, List<Vector3> Norms, List<Vector3> Cols, List<(int A, int B, int C)> Faces, List<int> Mats, int Dropped)>();
+        int completedCount = 0;
+
+        Parallel.ForEach(matchingNodes, parallelOptions, node =>
         {
-            if (node.Lod != targetLod) continue;
+            List<Vector3> localVerts = [];
+            List<Vector3> localNorms = [];
+            List<Vector3> localCols = [];
+            List<(int A, int B, int C)> localFaces = [];
+            List<int> localMats = [];
+            int localDropped = 0;
+
+            Dictionary<object, int> vmap = [];
 
             Vector3 nodeBase = new(
                 origin.X - sl * 0.49993896f + node.Cell.X * sl,
@@ -61,7 +79,7 @@ public static class MeshBuilder
                 int indexOffset = (int)(stream.BaseIndex * 2);
                 ReadOnlySpan<ushort> indices = MemoryMarshal.Cast<byte, ushort>(page.AsSpan(indexOffset, triCount * 3 * 2));
 
-                Dictionary<ushort, (int GlobalIdx, int MaterialIdx)> localMap = [];
+                Dictionary<ushort, (int LocalIdx, int MaterialIdx)> localMap = [];
 
                 foreach (ushort v in indices)
                 {
@@ -83,17 +101,17 @@ public static class MeshBuilder
                         ? (MathF.Round(worldPos.X, 4), MathF.Round(worldPos.Y, 4), MathF.Round(worldPos.Z, 4))
                         : (stream.PageFile, v);
 
-                    if (!vmap.TryGetValue(key, out int globalIdx))
+                    if (!vmap.TryGetValue(key, out int localIdx))
                     {
-                        globalIdx = mesh.Vertices.Count;
-                        vmap[key] = globalIdx;
+                        localIdx = localVerts.Count;
+                        vmap[key] = localIdx;
 
-                        mesh.Vertices.Add(worldPos);
-                        mesh.Normals.Add(OctNormalDecoder.Decode(nu, nv));
-                        mesh.Colors.Add(dec.Self.ColorRgb);
+                        localVerts.Add(worldPos);
+                        localNorms.Add(OctNormalDecoder.Decode(nu, nv));
+                        localCols.Add(dec.Self.ColorRgb);
                     }
 
-                    localMap[v] = (globalIdx, matIdx);
+                    localMap[v] = (localIdx, matIdx);
                 }
 
                 for (int t = 0; t < triCount; t++)
@@ -102,30 +120,73 @@ public static class MeshBuilder
                     ushort vB = indices[t * 3 + 1];
                     ushort vC = indices[t * 3 + 2];
 
-                    var (gA, matA) = localMap[vA];
-                    var (gB, _) = localMap[vB];
-                    var (gC, _) = localMap[vC];
+                    var (lA, matA) = localMap[vA];
+                    var (lB, _) = localMap[vB];
+                    var (lC, _) = localMap[vC];
 
-                    if (gA == gB || gB == gC || gA == gC) continue;
+                    if (lA == lB || lB == lC || lA == lC) continue;
 
                     if (clean > 0.0f)
                     {
-                        Vector3 pA = mesh.Vertices[gA];
-                        Vector3 pB = mesh.Vertices[gB];
-                        Vector3 pC = mesh.Vertices[gC];
+                        Vector3 pA = localVerts[lA];
+                        Vector3 pB = localVerts[lB];
+                        Vector3 pC = localVerts[lC];
 
                         if (Vector3.DistanceSquared(pA, pB) > cleanSq ||
                             Vector3.DistanceSquared(pB, pC) > cleanSq ||
                             Vector3.DistanceSquared(pC, pA) > cleanSq)
                         {
-                            mesh.DroppedFaces++;
+                            localDropped++;
                             continue;
                         }
                     }
 
-                    mesh.Faces.Add((gA, gB, gC));
-                    mesh.FaceMaterials.Add(matA);
+                    localFaces.Add((lA, lB, lC));
+                    localMats.Add(matA);
                 }
+            }
+
+            nodeResults.Add((localVerts, localNorms, localCols, localFaces, localMats, localDropped));
+
+            if (progressCallback != null)
+            {
+                int current = Interlocked.Increment(ref completedCount);
+                progressCallback(current, totalNodes);
+            }
+        });
+
+        // Merge thread node results into global mesh
+        Dictionary<object, int> globalVmap = [];
+
+        foreach (var res in nodeResults)
+        {
+            mesh.DroppedFaces += res.Dropped;
+            int[] remap = new int[res.Verts.Count];
+
+            for (int i = 0; i < res.Verts.Count; i++)
+            {
+                Vector3 pos = res.Verts[i];
+                object key = weld
+                    ? (MathF.Round(pos.X, 4), MathF.Round(pos.Y, 4), MathF.Round(pos.Z, 4))
+                    : res.Verts.Count * 31 + i;
+
+                if (!globalVmap.TryGetValue(key, out int gIdx))
+                {
+                    gIdx = mesh.Vertices.Count;
+                    globalVmap[key] = gIdx;
+
+                    mesh.Vertices.Add(pos);
+                    mesh.Normals.Add(res.Norms[i]);
+                    mesh.Colors.Add(res.Cols[i]);
+                }
+                remap[i] = gIdx;
+            }
+
+            for (int f = 0; f < res.Faces.Count; f++)
+            {
+                var (a, b, c) = res.Faces[f];
+                mesh.Faces.Add((remap[a], remap[b], remap[c]));
+                mesh.FaceMaterials.Add(res.Mats[f]);
             }
         }
 
