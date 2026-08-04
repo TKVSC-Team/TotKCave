@@ -4,13 +4,6 @@ using TotkCave.Models;
 
 namespace TotkCave.PageSource;
 
-/// <summary>
-/// Loads .quad pages, decompressing romfs ones if needed.
-///
-/// Console-dumped pages are already decompressed (their size equals the crbin's
-/// decompressed_size). A romfs .quad is a 4-byte crbin id followed by a plain
-/// zstd frame - no MeshCodec involved.
-/// </summary>
 public sealed class QuadPageSource : IPageSource
 {
     private readonly QuadResource _resource;

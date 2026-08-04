@@ -2,9 +2,6 @@ using System.Runtime.InteropServices;
 
 namespace TotkCave.Models;
 
-/// <summary>
-/// Represents the header of a MeshCodec compressed chunk file (ResChunkHeader).
-/// </summary>
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public readonly record struct ChunkHeader(
     uint ChunkHash,

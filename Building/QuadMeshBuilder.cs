@@ -10,7 +10,6 @@ namespace TotkCave.Building;
 
 public static class QuadMeshBuilder
 {
-    // Read on every quad from every worker thread, so these are lock-free reads.
     private static readonly ConcurrentDictionary<(int Ns, int Top, int Right, int Bottom, int Left, int Single), int[]> IndexCache = new();
     private static readonly ConcurrentDictionary<int, (int A, int B, int C)[]> FaceCache = new();
 
@@ -261,9 +260,7 @@ public static class QuadMeshBuilder
 
         int threads = maxDegreeOfParallelism > 0 ? maxDegreeOfParallelism : Environment.ProcessorCount;
         ParallelOptions parallelOptions = new() { MaxDegreeOfParallelism = threads };
-
-        // Indexed by node position so the merge order -- and the exported file --
-        // is identical on every run. A ConcurrentBag yields completion order.
+        
         var nodeResults = new (List<Vector3> Verts, List<(int A, int B, int C)> Faces)[totalNodes];
         int completedCount = 0;
 

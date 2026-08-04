@@ -48,10 +48,7 @@ public static class MeshBuilder
 
         int threads = maxDegreeOfParallelism > 0 ? maxDegreeOfParallelism : Environment.ProcessorCount;
         ParallelOptions parallelOptions = new() { MaxDegreeOfParallelism = threads };
-
-        // Indexed by node position, NOT a ConcurrentBag: the bag returns results in
-        // completion order, so the merged vertex/face order -- and therefore the
-        // exported file -- changed between identical runs.
+        
         var nodeResults = new (List<Vector3> Verts, List<Vector3> Norms, List<Vector3> Cols, List<(int A, int B, int C)> Faces, List<int> Mats, int Dropped)[totalNodes];
         int completedCount = 0;
 
@@ -158,12 +155,7 @@ public static class MeshBuilder
                 progressCallback(current, totalNodes);
             }
         });
-
-        // Merge thread node results into global mesh.
-        // Typed key, no boxing. When welding is off every vertex is appended
-        // directly: a synthesised key would have to be unique across nodes, and
-        // anything derived from (vertex count, index) collides as soon as two
-        // nodes have the same vertex count.
+        
         Dictionary<(float X, float Y, float Z), int> globalVmap = [];
 
         foreach (var res in nodeResults)

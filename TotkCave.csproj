@@ -2,12 +2,15 @@
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
+    <PackageId>Mind.TotkCave</PackageId>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Version>1.0.0</Version>
-    <Authors>Antigravity</Authors>
-    <Description>C# library for parsing, decompressing, building, and exporting Tears of the Kingdom cave and quad mesh streaming files.</Description>
+    <Authors>Mind</Authors>
+    <Description>C# library for parsing, decompressing, building, and exporting Tears of the Kingdom cave and quad mesh files.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>GPL-3.0</PackageLicenseExpression>
   </PropertyGroup>
 
   <ItemGroup>

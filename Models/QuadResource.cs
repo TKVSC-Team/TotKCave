@@ -24,10 +24,7 @@ public sealed class QuadResource
     public int NodeCount => (int)Arrays["nodes"].Count;
 
     private readonly byte[] _data;
-
-    // Hot-path array offsets, resolved once. Dictionary lookups (and, before,
-    // byte[] range slicing - which copies) made the per-node accessors below
-    // dominate the whole export.
+    
     private readonly int _nodesOff;
     private readonly int _nodeBoundsOff;
     private readonly int _layoutTypesOff;

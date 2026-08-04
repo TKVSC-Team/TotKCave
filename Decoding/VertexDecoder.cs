@@ -58,9 +58,6 @@ public static class VertexDecoder
             throw new ArgumentOutOfRangeException(nameof(vertexIndex), "Vertex index exceeds page buffer boundary.");
 
         uint patch = MemoryMarshal.Read<uint>(page[o..]);
-        // Three 9-bit slots at bits 5-13, 14-22, 23-31 (NOT 7-bit): a palette can
-        // hold up to 183 entries, and masking with 0x7F silently truncates
-        // anything above 127 to the wrong material.
         int[] mats = [
             (int)((patch >> 5) & 0x1FF),
             (int)((patch >> 14) & 0x1FF),
