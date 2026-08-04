@@ -49,11 +49,15 @@ public static class MeshBuilder
         int threads = maxDegreeOfParallelism > 0 ? maxDegreeOfParallelism : Environment.ProcessorCount;
         ParallelOptions parallelOptions = new() { MaxDegreeOfParallelism = threads };
 
-        var nodeResults = new ConcurrentBag<(List<Vector3> Verts, List<Vector3> Norms, List<Vector3> Cols, List<(int A, int B, int C)> Faces, List<int> Mats, int Dropped)>();
+        // Indexed by node position, NOT a ConcurrentBag: the bag returns results in
+        // completion order, so the merged vertex/face order -- and therefore the
+        // exported file -- changed between identical runs.
+        var nodeResults = new (List<Vector3> Verts, List<Vector3> Norms, List<Vector3> Cols, List<(int A, int B, int C)> Faces, List<int> Mats, int Dropped)[totalNodes];
         int completedCount = 0;
 
-        Parallel.ForEach(matchingNodes, parallelOptions, node =>
+        Parallel.For(0, totalNodes, parallelOptions, nodeIdx =>
         {
+            CrBinNode node = matchingNodes[nodeIdx];
             List<Vector3> localVerts = [];
             List<Vector3> localNorms = [];
             List<Vector3> localCols = [];
@@ -146,7 +150,7 @@ public static class MeshBuilder
                 }
             }
 
-            nodeResults.Add((localVerts, localNorms, localCols, localFaces, localMats, localDropped));
+            nodeResults[nodeIdx] = (localVerts, localNorms, localCols, localFaces, localMats, localDropped);
 
             if (progressCallback != null)
             {
@@ -155,8 +159,12 @@ public static class MeshBuilder
             }
         });
 
-        // Merge thread node results into global mesh
-        Dictionary<object, int> globalVmap = [];
+        // Merge thread node results into global mesh.
+        // Typed key, no boxing. When welding is off every vertex is appended
+        // directly: a synthesised key would have to be unique across nodes, and
+        // anything derived from (vertex count, index) collides as soon as two
+        // nodes have the same vertex count.
+        Dictionary<(float X, float Y, float Z), int> globalVmap = [];
 
         foreach (var res in nodeResults)
         {
@@ -166,20 +174,28 @@ public static class MeshBuilder
             for (int i = 0; i < res.Verts.Count; i++)
             {
                 Vector3 pos = res.Verts[i];
-                object key = weld
-                    ? (MathF.Round(pos.X, 4), MathF.Round(pos.Y, 4), MathF.Round(pos.Z, 4))
-                    : res.Verts.Count * 31 + i;
 
-                if (!globalVmap.TryGetValue(key, out int gIdx))
+                if (weld)
                 {
-                    gIdx = mesh.Vertices.Count;
-                    globalVmap[key] = gIdx;
+                    var key = (MathF.Round(pos.X, 4), MathF.Round(pos.Y, 4), MathF.Round(pos.Z, 4));
+                    if (!globalVmap.TryGetValue(key, out int gIdx))
+                    {
+                        gIdx = mesh.Vertices.Count;
+                        globalVmap[key] = gIdx;
 
+                        mesh.Vertices.Add(pos);
+                        mesh.Normals.Add(res.Norms[i]);
+                        mesh.Colors.Add(res.Cols[i]);
+                    }
+                    remap[i] = gIdx;
+                }
+                else
+                {
+                    remap[i] = mesh.Vertices.Count;
                     mesh.Vertices.Add(pos);
                     mesh.Normals.Add(res.Norms[i]);
                     mesh.Colors.Add(res.Cols[i]);
                 }
-                remap[i] = gIdx;
             }
 
             for (int f = 0; f < res.Faces.Count; f++)

@@ -262,13 +262,16 @@ public static class QuadMeshBuilder
         int threads = maxDegreeOfParallelism > 0 ? maxDegreeOfParallelism : Environment.ProcessorCount;
         ParallelOptions parallelOptions = new() { MaxDegreeOfParallelism = threads };
 
-        var nodeResults = new ConcurrentBag<(List<Vector3> Verts, List<(int A, int B, int C)> Faces)>();
+        // Indexed by node position so the merge order -- and the exported file --
+        // is identical on every run. A ConcurrentBag yields completion order.
+        var nodeResults = new (List<Vector3> Verts, List<(int A, int B, int C)> Faces)[totalNodes];
         int completedCount = 0;
 
-        Parallel.ForEach(matchingNodeIndices, parallelOptions, i =>
+        Parallel.For(0, totalNodes, parallelOptions, idx =>
         {
+            int i = matchingNodeIndices[idx];
             var (localVerts, localFaces) = DecodeNodeGeometry(res, pages, i, targetLod, weld);
-            nodeResults.Add((localVerts, localFaces));
+            nodeResults[idx] = (localVerts, localFaces);
 
             if (progressCallback != null)
             {
